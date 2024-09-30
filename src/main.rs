@@ -1,15 +1,15 @@
 use std::env;
-use std::fmt::format;
+use std::env::VarError;
 use std::time::{SystemTime, UNIX_EPOCH};
 use aws_lambda_events::event::cloudwatch_events::CloudWatchEvent;
-use chrono::{DateTime, Local, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Tz, US};
-use color_eyre::eyre;
-use futures::{poll, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
-use lambda_runtime::tracing::info;
+use lambda_runtime::tracing::{error, info, warn};
 use serde::{Deserialize, Deserializer};
 use serde::de::Error as DeserializerError;
+use aws_sdk_dynamodb::Client as DynamoDbClient;
 
 fn unix_timestamp_ms() -> i64 {
     let now = SystemTime::now()
@@ -76,17 +76,17 @@ impl From<WasteWaterCsvRow> for WasteWaterSample {
         let sample_summary = [
             row.site_name.as_str(),
             &row.county,
-            &row.pcr_pathogen_target, 
+            &row.pcr_pathogen_target,
             &row.pcr_gene_target].join(";");
-        
+
         let poll_timestamp = unix_timestamp_ms();
-        
+
         let sample_collection_sort = format!(
             "{};{}",
             row.sample_collection_date.format("%Y-%m-%d"),
             poll_timestamp
         );
-        
+
         Self {
             sample_summary,
             sample_collection_sort,
@@ -107,18 +107,40 @@ async fn handler(wastewater_url: &str, event: LambdaEvent<CloudWatchEvent>) -> R
     let response_reader = response.bytes_stream().map_err(std::io::Error::other).into_async_read();
     let mut csv_reader = csv_async::AsyncDeserializer::from_reader(response_reader);
     let records = csv_reader.deserialize::<WasteWaterCsvRow>();
-    let sample_data = records.map_ok(WasteWaterSample::from);
+    let mut sample_data = records.map_ok(WasteWaterSample::from);
+
+    while let Some(record_result) = sample_data.next().await {
+        match record_result {
+            Ok(record) => println!("{:?}", record),
+            Err(e) => eprintln!("Error getting record: {:?}", e)
+        }
+    }
 
     Ok(())
 }
+
+static ENVVAR_WASTEWATER_URL: &str = "URL_WAGOV_WASTEWATER";
+static DEFAULT_WASTEWATER_URL: &str = "https://doh.wa.gov/sites/default/files/Data/Downloadable_Wastewater.csv";
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing::init_default_subscriber();
 
-    let wastewater_url = env::var("URL_WAGOV_WASTEWATER").expect("No wastewater url environment variable.");
+    let wastewater_url = match env::var(ENVVAR_WASTEWATER_URL) {
+        Ok(url) => {
+            info!("Wastewater_url: {}", url);
+            url
+        }
+        Err(VarError::NotPresent) => {
+            warn!("{ENVVAR_WASTEWATER_URL} not set, using default: {DEFAULT_WASTEWATER_URL}");
+            DEFAULT_WASTEWATER_URL.to_string()
+        }
+        Err(e) => panic!("Error getting {ENVVAR_WASTEWATER_URL}: {e}")
+    };
 
-    info!(wastewater_url);
+    //let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    //let dynamodb_client_config = aws_sdk_dynamodb::config::Builder::from(&config).build();
+    //let dynamodb_client = DynamoDbClient::from_conf(dynamodb_client_config);
 
     run(service_fn(|event: LambdaEvent<CloudWatchEvent>| async {
         handler(&wastewater_url, event).await

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::env::VarError;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +11,8 @@ use lambda_runtime::tracing::{error, info, warn};
 use serde::{Deserialize, Deserializer};
 use serde::de::Error as DeserializerError;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
+use aws_sdk_dynamodb::types::AttributeValue;
+use velcro::hash_map;
 
 fn unix_timestamp_ms() -> i64 {
     let now = SystemTime::now()
@@ -102,7 +105,24 @@ impl From<WasteWaterCsvRow> for WasteWaterSample {
     }
 }
 
-async fn handler(wastewater_url: &str, event: LambdaEvent<CloudWatchEvent>) -> Result<(), Error> {
+impl From<WasteWaterSample> for HashMap<String, AttributeValue> {
+    fn from(value: WasteWaterSample) -> Self {
+        hash_map! {
+            "sample_summary".to_string(): AttributeValue::S(value.sample_summary),
+            "sample_collection_sort".to_string(): AttributeValue::S(value.sample_collection_sort),
+            "sample_collection_date".to_string(): AttributeValue::S(value.sample_collection_date.to_string()),
+            "site_name".to_string(): AttributeValue::S(value.site_name),
+            "county".to_string(): AttributeValue::S(value.county),
+            "pcr_pathogen_target".to_string(): AttributeValue::S(value.pcr_pathogen_target),
+            "pcr_gene_target".to_string(): AttributeValue::S(value.pcr_gene_target),
+            "normalized_pathogen_concentration".to_string(): AttributeValue::N(value.normalized_pathogen_concentration.to_string()),
+            "date_updated".to_string(): AttributeValue::S(value.date_updated.to_rfc3339()),
+            "poll_timestamp".to_string(): AttributeValue::N(value.poll_timestamp.to_string())
+        }
+    }
+}
+
+async fn handler(wastewater_url: &str, dynamo_db_client: &DynamoDbClient, event: LambdaEvent<CloudWatchEvent>) -> Result<(), Error> {
     let response = reqwest::get(wastewater_url).await?.error_for_status()?;
     let response_reader = response.bytes_stream().map_err(std::io::Error::other).into_async_read();
     let mut csv_reader = csv_async::AsyncDeserializer::from_reader(response_reader);
@@ -111,8 +131,19 @@ async fn handler(wastewater_url: &str, event: LambdaEvent<CloudWatchEvent>) -> R
 
     while let Some(record_result) = sample_data.next().await {
         match record_result {
-            Ok(record) => println!("{:?}", record),
-            Err(e) => eprintln!("Error getting record: {:?}", e)
+            Err(e) => eprintln!("Error getting record: {:?}", e),
+            Ok(record) => {
+                let send_result = dynamo_db_client
+                    .put_item()
+                    .table_name("wastewatersample")
+                    .set_item(Some(record.into()))
+                    .send()
+                    .await;
+
+                if let Err(e) = send_result {
+                    eprintln!("Error sending PutItem to dynamo_db: {:?}", e);
+                }
+            }
         }
     }
 
@@ -120,6 +151,7 @@ async fn handler(wastewater_url: &str, event: LambdaEvent<CloudWatchEvent>) -> R
 }
 
 static ENVVAR_WASTEWATER_URL: &str = "URL_WAGOV_WASTEWATER";
+static ENVVAR_TEST_DYNAMODB: &str = "TEST_LOCAL_DYNAMODB";
 static DEFAULT_WASTEWATER_URL: &str = "https://doh.wa.gov/sites/default/files/Data/Downloadable_Wastewater.csv";
 
 #[tokio::main]
@@ -138,11 +170,24 @@ async fn main() -> Result<(), Error> {
         Err(e) => panic!("Error getting {ENVVAR_WASTEWATER_URL}: {e}")
     };
 
-    //let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    //let dynamodb_client_config = aws_sdk_dynamodb::config::Builder::from(&config).build();
-    //let dynamodb_client = DynamoDbClient::from_conf(dynamodb_client_config);
+    let config = match env::var(ENVVAR_TEST_DYNAMODB) {
+        Ok(endpoint_url) => {
+            info!("Using local DynamoDB endpoint: {}", endpoint_url);
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .test_credentials()
+                .endpoint_url(endpoint_url)
+                .load()
+                .await
+        },
+        // Production environment 
+        Err(VarError::NotPresent) => aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+        Err(e) => panic!("Error getting DynamoDB endpoint: {e}")
+    };
+    
+    let dynamodb_client_config = aws_sdk_dynamodb::config::Builder::from(&config).build();
+    let dynamodb_client = DynamoDbClient::from_conf(dynamodb_client_config);
 
     run(service_fn(|event: LambdaEvent<CloudWatchEvent>| async {
-        handler(&wastewater_url, event).await
+        handler(&wastewater_url, &dynamodb_client, event).await
     })).await
 }

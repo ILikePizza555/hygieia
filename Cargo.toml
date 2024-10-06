@@ -6,6 +6,7 @@ edition = "2021"
 [package.metadata.lambda.env]
 AWS_REGION = "us-west-2"
 TEST_LOCAL_DYNAMODB = "http://localhost:8000"
+RUST_LOG = "info,hygieia=trace"
 
 [dependencies]
 aws-config = "1.5.7"

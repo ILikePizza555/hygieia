@@ -7,7 +7,7 @@ use chrono::{DateTime, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::{Tz, US};
 use futures::{StreamExt, TryStreamExt};
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
-use lambda_runtime::tracing::{error, info, warn};
+use lambda_runtime::tracing::{error, info, trace, warn};
 use serde::{Deserialize, Deserializer};
 use serde::de::Error as DeserializerError;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
@@ -62,7 +62,7 @@ fn deserialize_pdt_datetime<'de, D>(deserializer: D) -> Result<DateTime<Tz>, D::
 struct WasteWaterSample {
     /// Semicolon separated concatenation of Site Name, County, PCR Pathogen Target, and the PCR Gene Target
     sample_summary: String,
-    /// The sample collection date concatenated with the unix timestamp in ms this row was created.
+    /// The sample collection date concatenated date_updated.
     sample_collection_sort: String,
     sample_collection_date: NaiveDate,
     site_name: String,
@@ -71,6 +71,7 @@ struct WasteWaterSample {
     pcr_gene_target: String,
     normalized_pathogen_concentration: f64,
     date_updated: DateTime<Tz>,
+    // When this entry was queried and added.
     poll_timestamp: i64
 }
 
@@ -87,7 +88,7 @@ impl From<WasteWaterCsvRow> for WasteWaterSample {
         let sample_collection_sort = format!(
             "{};{}",
             row.sample_collection_date.format("%Y-%m-%d"),
-            poll_timestamp
+            row.date_updated.to_rfc3339()
         );
 
         Self {
@@ -128,11 +129,17 @@ async fn handler(wastewater_url: &str, dynamo_db_client: &DynamoDbClient, event:
     let mut csv_reader = csv_async::AsyncDeserializer::from_reader(response_reader);
     let records = csv_reader.deserialize::<WasteWaterCsvRow>();
     let mut sample_data = records.map_ok(WasteWaterSample::from);
-
+    
+    let mut total_count = 0;
+    let mut success_count = 0;
     while let Some(record_result) = sample_data.next().await {
+        total_count += 1;
+        
         match record_result {
             Err(e) => eprintln!("Error getting record: {:?}", e),
             Ok(record) => {
+                trace!("Inserting record {record:?}");
+                
                 let send_result = dynamo_db_client
                     .put_item()
                     .table_name("wastewatersample")
@@ -142,10 +149,13 @@ async fn handler(wastewater_url: &str, dynamo_db_client: &DynamoDbClient, event:
 
                 if let Err(e) = send_result {
                     eprintln!("Error sending PutItem to dynamo_db: {:?}", e);
+                } else {
+                    success_count += 1;
                 }
             }
         }
     }
+    info!("Successfully inserts {success_count}/{total_count} items.");
 
     Ok(())
 }

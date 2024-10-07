@@ -50,10 +50,11 @@ fn init_sqlite_db() -> eyre::Result<Connection> {
 
 #[instrument]
 fn init() -> eyre::Result<(String, Connection)> {
-    useful::init_tracing();
-
     // Load environment variables
+    // Want to do it before init_tracing to load rust_log
     dotenvy::dotenv()?;
+
+    useful::init_tracing();
 
     // Load Wastewater URL from environment variable, defaulting to DEFAULT_WASTEWATER_URL if not set
     let wastewater_url = get_wastewater_url()?;

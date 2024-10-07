@@ -40,11 +40,16 @@ fn init_sqlite_db() -> eyre::Result<Connection> {
     debug!("Opening SQLite DB at {sqlite_db_path}");
 
     let db_conn = Connection::open(sqlite_db_path)?;
+    debug!("Successfully opened SQLite DB.");
+
+    // Apply schema
+    db_conn.execute_batch(include_str!("schema.sql"))?;
+
     Ok(db_conn)
 }
 
 #[instrument]
-fn init() -> eyre::Result<String> {
+fn init() -> eyre::Result<(String, Connection)> {
     useful::init_tracing();
 
     // Load environment variables
@@ -55,14 +60,26 @@ fn init() -> eyre::Result<String> {
     debug!("Loaded Wastewater URL from ENV: {}", wastewater_url);
 
     // Load sqlite database, creating it if it doesn't exist
+    let db_conn = init_sqlite_db()?;
 
-    Ok(wastewater_url)
+    Ok((wastewater_url, db_conn))
 }
 
 fn main() -> eyre::Result<()> {
-    let wastewater_url = init()?;
+    let (wastewater_url, mut db_conn) = init()?;
 
     info!("Requesting Wastewater data from {}", wastewater_url);
+
+    let response = ureq::get(&wastewater_url).call()?;
+    info!(
+        "Response: OK, Content-Type: {:?}, Content-Length: {:?}",
+        response.header("Content-Type"),
+        response.header("Content-Length")
+    );
+    let reader = response.into_reader();
+
+    let data = csv_data::parse_data(reader).filter_map(|r| r.ok());
+    db::insert_wastewater_samples(&mut db_conn, data)?;
 
     Ok(())
 }

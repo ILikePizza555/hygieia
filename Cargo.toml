@@ -3,11 +3,6 @@ name = "hygieia"
 version = "0.1.0"
 edition = "2021"
 
-[package.metadata.lambda.env]
-AWS_REGION = "us-west-2"
-TEST_LOCAL_DYNAMODB = "http://localhost:8000"
-RUST_LOG = "info,hygieia=trace"
-
 [dependencies]
 chrono = { version = "0.4.38", features = ["serde"] }
 chrono-tz = "0.10.0"
@@ -22,4 +17,3 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "chrono"] }
 ureq = "2.10.1"
 uuid = { version = "1.10.0", features = ["v7", "zerocopy"] }
 velcro = "0.5.4"
-

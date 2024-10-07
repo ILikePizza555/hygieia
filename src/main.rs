@@ -1,203 +1,68 @@
-use std::collections::HashMap;
-use std::env;
-use std::env::VarError;
-use std::time::{SystemTime, UNIX_EPOCH};
-use aws_lambda_events::event::cloudwatch_events::CloudWatchEvent;
-use chrono::{DateTime, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone};
-use chrono_tz::{Tz, US};
-use futures::{StreamExt, TryStreamExt};
-use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
-use lambda_runtime::tracing::{error, info, trace, warn};
-use serde::{Deserialize, Deserializer};
-use serde::de::Error as DeserializerError;
-use aws_sdk_dynamodb::Client as DynamoDbClient;
-use aws_sdk_dynamodb::types::AttributeValue;
-use velcro::hash_map;
+mod csv_data;
+mod db;
+mod useful;
 
-fn unix_timestamp_ms() -> i64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards: system time is somehow set to before the UNIX epoch.");
-    i64::try_from(now.as_millis())
-        .expect("Current UNIX timestamp is too big for i64. Hello from 2024, creature living in 7849!")
-}
-
-/// Describes a row of data as parsed from the CSV file
-#[derive(Debug, Deserialize)]
-struct WasteWaterCsvRow {
-    #[serde(rename = "Sample Collection Date")]
-    sample_collection_date: NaiveDate,
-    #[serde(rename = "Site Name")]
-    site_name: String,
-    #[serde(rename = "County")]
-    county: String,
-    #[serde(rename = "PCR Pathogen Target")]
-    pcr_pathogen_target: String,
-    #[serde(rename = "PCR Gene Target")]
-    pcr_gene_target: String,
-    #[serde(rename = "Normalized Pathogen Concentration (gene copies/person/day)")]
-    normalized_pathogen_concentration: f64,
-    #[serde(rename = "Date/Time Updated")]
-    #[serde(deserialize_with = "deserialize_pdt_datetime")]
-    date_updated: DateTime<Tz>
-}
-
-fn deserialize_pdt_datetime<'de, D>(deserializer: D) -> Result<DateTime<Tz>, D::Error> where D: Deserializer<'de> {
-    let s = String::deserialize(deserializer)?;
-    let mapped_date_time = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S.%f")
-        .map_err(D::Error::custom)?
-        .and_local_timezone(US::Pacific);
-
-    match mapped_date_time {
-        // 99% of cases
-        MappedLocalTime::Single(date_time) => Ok(date_time),
-        // Clock was turned backwards and now there are two times
-        MappedLocalTime::Ambiguous(_, latest) => Ok(latest),
-        // Clock was turned forwards and the time doesn't exit
-        MappedLocalTime::None => Err(D::Error::custom(format!("Datetime {} is invalid for Pacific timezone.", s)))
-    }
-}
-
-#[derive(Debug)]
-struct WasteWaterSample {
-    /// Semicolon separated concatenation of Site Name, County, PCR Pathogen Target, and the PCR Gene Target
-    sample_summary: String,
-    /// The sample collection date concatenated date_updated.
-    sample_collection_sort: String,
-    sample_collection_date: NaiveDate,
-    site_name: String,
-    county: String,
-    pcr_pathogen_target: String,
-    pcr_gene_target: String,
-    normalized_pathogen_concentration: f64,
-    date_updated: DateTime<Tz>,
-    // When this entry was queried and added.
-    poll_timestamp: i64
-}
-
-impl From<WasteWaterCsvRow> for WasteWaterSample {
-    fn from(row: WasteWaterCsvRow) -> Self {
-        let sample_summary = [
-            row.site_name.as_str(),
-            &row.county,
-            &row.pcr_pathogen_target,
-            &row.pcr_gene_target].join(";");
-
-        let poll_timestamp = unix_timestamp_ms();
-
-        let sample_collection_sort = format!(
-            "{};{}",
-            row.sample_collection_date.format("%Y-%m-%d"),
-            row.date_updated.to_rfc3339()
-        );
-
-        Self {
-            sample_summary,
-            sample_collection_sort,
-            sample_collection_date: row.sample_collection_date,
-            site_name: row.site_name,
-            county: row.county,
-            pcr_pathogen_target: row.pcr_pathogen_target,
-            pcr_gene_target: row.pcr_gene_target,
-            normalized_pathogen_concentration: row.normalized_pathogen_concentration,
-            date_updated: row.date_updated,
-            poll_timestamp
-        }
-    }
-}
-
-impl From<WasteWaterSample> for HashMap<String, AttributeValue> {
-    fn from(value: WasteWaterSample) -> Self {
-        hash_map! {
-            "sample_summary".to_string(): AttributeValue::S(value.sample_summary),
-            "sample_collection_sort".to_string(): AttributeValue::S(value.sample_collection_sort),
-            "sample_collection_date".to_string(): AttributeValue::S(value.sample_collection_date.to_string()),
-            "site_name".to_string(): AttributeValue::S(value.site_name),
-            "county".to_string(): AttributeValue::S(value.county),
-            "pcr_pathogen_target".to_string(): AttributeValue::S(value.pcr_pathogen_target),
-            "pcr_gene_target".to_string(): AttributeValue::S(value.pcr_gene_target),
-            "normalized_pathogen_concentration".to_string(): AttributeValue::N(value.normalized_pathogen_concentration.to_string()),
-            "date_updated".to_string(): AttributeValue::S(value.date_updated.to_rfc3339()),
-            "poll_timestamp".to_string(): AttributeValue::N(value.poll_timestamp.to_string())
-        }
-    }
-}
-
-async fn handler(wastewater_url: &str, dynamo_db_client: &DynamoDbClient, event: LambdaEvent<CloudWatchEvent>) -> Result<(), Error> {
-    let response = reqwest::get(wastewater_url).await?.error_for_status()?;
-    let response_reader = response.bytes_stream().map_err(std::io::Error::other).into_async_read();
-    let mut csv_reader = csv_async::AsyncDeserializer::from_reader(response_reader);
-    let records = csv_reader.deserialize::<WasteWaterCsvRow>();
-    let mut sample_data = records.map_ok(WasteWaterSample::from);
-    
-    let mut total_count = 0;
-    let mut success_count = 0;
-    while let Some(record_result) = sample_data.next().await {
-        total_count += 1;
-        
-        match record_result {
-            Err(e) => eprintln!("Error getting record: {:?}", e),
-            Ok(record) => {
-                trace!("Inserting record {record:?}");
-                
-                let send_result = dynamo_db_client
-                    .put_item()
-                    .table_name("wastewatersample")
-                    .set_item(Some(record.into()))
-                    .send()
-                    .await;
-
-                if let Err(e) = send_result {
-                    eprintln!("Error sending PutItem to dynamo_db: {:?}", e);
-                } else {
-                    success_count += 1;
-                }
-            }
-        }
-    }
-    info!("Successfully inserts {success_count}/{total_count} items.");
-
-    Ok(())
-}
+use color_eyre::eyre::{self, Context};
+use rusqlite::Connection;
+use tracing::{debug, info, instrument, warn};
 
 static ENVVAR_WASTEWATER_URL: &str = "URL_WAGOV_WASTEWATER";
-static ENVVAR_TEST_DYNAMODB: &str = "TEST_LOCAL_DYNAMODB";
-static DEFAULT_WASTEWATER_URL: &str = "https://doh.wa.gov/sites/default/files/Data/Downloadable_Wastewater.csv";
+static DEFAULT_WASTEWATER_URL: &str =
+    "https://doh.wa.gov/sites/default/files/Data/Downloadable_Wastewater.csv";
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    tracing::init_default_subscriber();
+fn get_wastewater_url() -> eyre::Result<String> {
+    let wastewater_url = useful::env_or_else(ENVVAR_WASTEWATER_URL, || {
+        info!("{ENVVAR_WASTEWATER_URL} not set, using default: {DEFAULT_WASTEWATER_URL}");
+        DEFAULT_WASTEWATER_URL.to_string()
+    })
+    .with_context(|| format!("Error getting {ENVVAR_WASTEWATER_URL}"))?;
 
-    let wastewater_url = match env::var(ENVVAR_WASTEWATER_URL) {
-        Ok(url) => {
-            info!("Wastewater_url: {}", url);
-            url
-        }
-        Err(VarError::NotPresent) => {
-            warn!("{ENVVAR_WASTEWATER_URL} not set, using default: {DEFAULT_WASTEWATER_URL}");
-            DEFAULT_WASTEWATER_URL.to_string()
-        }
-        Err(e) => panic!("Error getting {ENVVAR_WASTEWATER_URL}: {e}")
-    };
+    Ok(wastewater_url)
+}
 
-    let config = match env::var(ENVVAR_TEST_DYNAMODB) {
-        Ok(endpoint_url) => {
-            info!("Using local DynamoDB endpoint: {}", endpoint_url);
-            aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .test_credentials()
-                .endpoint_url(endpoint_url)
-                .load()
-                .await
-        },
-        // Production environment 
-        Err(VarError::NotPresent) => aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
-        Err(e) => panic!("Error getting DynamoDB endpoint: {e}")
-    };
-    
-    let dynamodb_client_config = aws_sdk_dynamodb::config::Builder::from(&config).build();
-    let dynamodb_client = DynamoDbClient::from_conf(dynamodb_client_config);
+static ENVVAR_SQLITE_DB_PATH: &str = "SQLITE_DB_PATH";
+static DEFAULT_SQLITE_DB_PATH: &str = "wastewater.sqlite";
 
-    run(service_fn(|event: LambdaEvent<CloudWatchEvent>| async {
-        handler(&wastewater_url, &dynamodb_client, event).await
-    })).await
+fn get_sqlite_db_path() -> eyre::Result<String> {
+    let sqlite_db_path = useful::env_or_else(ENVVAR_SQLITE_DB_PATH, || {
+        info!("{ENVVAR_SQLITE_DB_PATH} not set, using default: {DEFAULT_SQLITE_DB_PATH}");
+        DEFAULT_SQLITE_DB_PATH.to_string()
+    })
+    .with_context(|| format!("Error getting {ENVVAR_SQLITE_DB_PATH}"))?;
+
+    Ok(sqlite_db_path)
+}
+
+/// Opens a connection to the SQLite database, creating it if it doesn't exist.
+/// Applies schema if it doesn't exist.
+fn init_sqlite_db() -> eyre::Result<Connection> {
+    let sqlite_db_path = get_sqlite_db_path()?;
+    debug!("Opening SQLite DB at {sqlite_db_path}");
+
+    let db_conn = Connection::open(sqlite_db_path)?;
+    Ok(db_conn)
+}
+
+#[instrument]
+fn init() -> eyre::Result<String> {
+    useful::init_tracing();
+
+    // Load environment variables
+    dotenvy::dotenv()?;
+
+    // Load Wastewater URL from environment variable, defaulting to DEFAULT_WASTEWATER_URL if not set
+    let wastewater_url = get_wastewater_url()?;
+    debug!("Loaded Wastewater URL from ENV: {}", wastewater_url);
+
+    // Load sqlite database, creating it if it doesn't exist
+
+    Ok(wastewater_url)
+}
+
+fn main() -> eyre::Result<()> {
+    let wastewater_url = init()?;
+
+    info!("Requesting Wastewater data from {}", wastewater_url);
+
+    Ok(())
 }

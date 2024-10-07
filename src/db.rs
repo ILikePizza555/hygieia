@@ -2,13 +2,10 @@ use std::{error::Error, time::SystemTimeError};
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use color_eyre::eyre;
-use rusqlite::{named_params, types::FromSql, Connection, OptionalExtension, Row};
-use tracing::{error, instrument, trace};
+use rusqlite::{named_params, Connection, OptionalExtension, Row};
+use tracing::{error, info, instrument, trace};
 
-use crate::{
-    csv_data::WasteWaterCsvRow,
-    useful::{self, try_unix_timestamp},
-};
+use crate::{csv_data::WasteWaterCsvRow, useful::try_unix_timestamp};
 
 #[derive(Debug)]
 /// A normalized record of a wastewater sample.
@@ -67,7 +64,9 @@ impl TryFrom<WasteWaterCsvRow> for WasteWaterSample {
     }
 }
 
-pub fn insert_wastewater_sample(conn: &Connection, sample: WasteWaterSample) -> eyre::Result<()> {
+/// Inserts a sample into the database if it doesn't exist.
+/// Returns true if the sample was inserted, false otherwise.
+pub fn insert_wastewater_sample(conn: &Connection, sample: WasteWaterSample) -> eyre::Result<bool> {
     const SELECT_SAMPLE_SQL: &str = "
     SELECT * FROM wastewater_samples
     WHERE sample_collection_date = :sample_collection_date
@@ -99,7 +98,7 @@ pub fn insert_wastewater_sample(conn: &Connection, sample: WasteWaterSample) -> 
     match maybe_existing_sample {
         Some(existing_sample) => {
             trace!("Skipping sample insertion because it already exists: New: {sample:?}, Existing: {existing_sample:?}");
-            Ok(())
+            Ok(false)
         }
         None => {
             insert_stmt.execute(named_params! {
@@ -114,7 +113,7 @@ pub fn insert_wastewater_sample(conn: &Connection, sample: WasteWaterSample) -> 
             })?;
 
             trace!("Inserted sample: {:?}", sample);
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -128,16 +127,31 @@ where
 {
     let tx = conn.transaction()?;
 
+    let mut total_sample: usize = 0;
+    let mut errors: usize = 0;
+    let mut skip: usize = 0;
+
     for unprocessed_sample in samples {
+        total_sample += 1;
+
         match unprocessed_sample.try_into() {
-            Ok(sample) => insert_wastewater_sample(&tx, sample)?,
+            Ok(sample) => {
+                let inserted = insert_wastewater_sample(&tx, sample)?;
+                if !inserted {
+                    skip += 1;
+                }
+            }
             Err(e) => {
+                errors += 1;
                 error!("Skipping sample due to conversion error: {e}");
             }
         }
     }
 
     tx.commit()?;
+
+    let total_insertions = total_sample - errors - skip;
+    info!("Inserted {total_insertions} records ({errors} errors, {skip} skipped, {total_sample} total)");
 
     Ok(())
 }
